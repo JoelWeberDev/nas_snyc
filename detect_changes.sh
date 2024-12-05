@@ -13,6 +13,7 @@
 # With this we can simply compare the last modification date with the current one
 # 2. Has the fs structure changed at all?
 # Please note that both of these cases can be similtaneously true.
+# Also please note that all the file paths will be absolute paths
 # 
 # TODO:
 # 1. Create means for modification of the line in the states file
@@ -24,7 +25,9 @@
 # 3. Create ledger file and its writing functions (new script)
 
 FS_DIR="/home/joel/Development/nas/test_fs"
-STATES_NAME="states.txt"
+LEDGER="ledger.txt"
+
+### Date functions ###
 
 # File metadata reading
 read_metadata() {
@@ -33,7 +36,7 @@ read_metadata() {
     echo "$metadata"
 }
 
-# read_metadata "$FS_DIR/$STATES_NAME"
+# read_metadata "$FS_DIR/$LEDGER"
 
 date_cmp() {
     local date1=$1
@@ -87,35 +90,18 @@ get_mod_time() {
     echo "$modify_date"
 
     return 0
-
-    # new_date=$(($modify_date + 10))
-    # # readj_date=$(date -d "@$new_date" +"%Y-%m-%d %H:%M:%S")
-    # m10_date=$((new_date - 10))
-    # echo "Readjusted date: $m10_date"
-    # echo "+10 date: $new_date"
-    # echo "Modify date: $modify_date"
-
-    # # # Compare dates
-    # date_cmp "$modify_date" "$new_date"
-    # cmp1=$?
-    # date_cmp "$new_date" "$modify_date"
-    # cmp2=$?
-    # date_cmp "$modify_date" "$m10_date"
-    # cmp3=$?
-
-    # echo "cmp1: $cmp1"
-    # echo "cmp2: $cmp2"
-    # echo "cmp3: $cmp3"
 }
 
-# get_mod_time "$FS_DIR/$STATES_NAME"
+# get_mod_time "$FS_DIR/$LEDGER"
 
 get_states() {
-    echo "Reading $FS_DIR/$STATES_NAME :"
-    cat "$FS_DIR/$STATES_NAME"
+    echo "Reading $FS_DIR/$LEDGER:"
+    cat "$FS_DIR/$LEDGER"
 }
 
 # get_states
+
+### Ledger interaction functions ###
 
 parse_states_line() {
     # Takes a line read from the states file and parses it into a file name and date of last modification
@@ -138,20 +124,82 @@ parse_states_line() {
 
 }
 
+print_line() {
+    local file=$1
+    local mod_date=$2
+    local line_num=$3
+    local args=("$@")
+
+    echo "File: $file"
+    echo "Mod date: $mod_date"
+    echo "Line number: $line_num"
+    echo "Args: ${args[@]:3}"
+
+    return 0
+}
+
+cmp_file_name() {
+    # Compares the file name in the states file with the given file name
+    local ledger_fname=$1
+    local mod_date=$2
+    local line_num=$3
+    local fname=$4
+
+    # local states_fname=$(parse_states_line "$states_file" | sed -n '1p')
+
+    if [ "$ledger_fname" == "$fname" ]; then
+        return 2
+    else
+        return 0
+    fi
+}
+
+queue_changed() {
+    # This takes the date corrsponding to a file date and queues it for syncing
+    local ledger_fname=$1
+    local mod_date=$2
+    local line_num=$3
+    local other_date=$4
+
+    date_cmp "$mod_date" "$other_date"
+    local cmp=$?    
+
+    if [ $cmp -eq 2 ]; then
+        echo "File has been modified"
+        # Queue the file for syncing
+    else
+        echo "File has not been modified"
+    fi
+
+    return 0
+}
 
 line_by_line() {
     # Iterates through the state file line by line and executes a function on each line
-    # The process function must take the file name and the date of last modification as aguments
-    local process_func=$1
-    i=0
-    ignore="^#"
-    ws="^[[:space:]]*$"
-    while IFS= read -r line || [[ -n "$line" ]]; do
+    # The process function must take the file name, the mod date and line number as arguments
+    # Process function returns are as follows:
+    # 0: Success
+    # 1: Failure
+    # 2: Return true from line_by_line
+    # 3: Return false from line_by_line
+    local file=$1
+    local process_func=$2
+    local args=("$@")
+    local i=0
+    local ignore="^#"
+    local ws="^[[:space:]]*$"
+    
+    if [ ! -e "$file" ]; then
+        echo "$file does not exist"
+        return 1
+    fi  
 
-        if [[ $line =~ $ignore || $line =~ $ws ]]; then
-            echo "Ignoring line $i"
-        else
-            echo "line $i: $line"
+    # Read the file into an array to avoid issues with modifying the file while reading it
+    mapfile -t lines < "$file"
+
+    for line in "${lines[@]}"; do
+
+        if [[ ! ($line =~ $ignore || $line =~ $ws) ]]; then
             local output
             output=$(parse_states_line "$line")
             local valid=$?
@@ -164,16 +212,24 @@ line_by_line() {
                 local fname=$(echo "$output" | sed -n '1p')
                 local mod_date=$(echo "$output" | sed -n '2p')
                 
-                process_func "$fname" "$mod_date"
-                
+                # Call the processing function on the line
+                "${process_func}" "$fname" "$mod_date" "$i" "${args[@]:2}"
+
+                # Check the return value of the processing function
+                local ret=$?
+                if [ $ret -eq 2 ]; then
+                    return 2 # Return true
+                elif [ $ret -eq 3 ]; then
+                    return 3 # Return false
+                fi
             fi
         fi
 
         ((i++))
-    done < "$FS_DIR/$STATES_NAME"
-}
+    done
 
-line_by_line
+    return 0
+}
 
 append_line() {
     local fname=$1
@@ -182,19 +238,83 @@ append_line() {
     echo "$line" >> "$fname"
 }
 
-# append_line "$FS_DIR/$STATES_NAME" "Legit line"
+# append_line "$FS_DIR/$LEDGER" "Legit line"
 
 insert_line() {
+    # insert line at specified line number (line number is 1 indexed)
+    # when inserting a line the current line at that number is pushed down
     local file=$1
     local line_num=$2
     local text=$3
 
-    # Insert text at specified line
-    sed -i "${line_num}i\\${text}" "$file"
+    # if the line number is greater than the number of lines in the file, append the text to the end of the file
+    if [ $line_num -gt $(wc -l < "$file") ]; then
+        append_line "$file" "$text"
+
+    else
+        # Insert text at specified line 
+        sed -i "${line_num}i\\${text}" "$file"
+    fi
+
 }
 
-# insert_line "$FS_DIR/$STATES_NAME" 2 "inserted_line"
-# get_states
+search_insert_pos() {
+    # Binary searches the file for the correct position to insert the line
+    # If the line already exists, the function will return the line number
+    # If the line does not exist, the function will return the line number to insert the line
+    local search_name=$1
+    local found=$2
+
+    mapfile -t lines < "$FS_DIR/$LEDGER"
+
+    local low=0
+    # local high=$(wc -l < "$FS_DIR/$LEDGER")
+    local high=${#lines[@]}
+
+    # Find the first entry that is not comments or whitespace
+    local ignore="^#"
+    local ws="^[[:space:]]*$"
+    
+    while [[ (${lines[low]} =~ $ignore || ${lines[low]} =~ $ws) && $low -lt $high ]]; do
+        # echo ${lines[low]}
+        ((low++))
+    done
+
+    while [[ (${lines[high]} =~ $ignore || ${lines[high]} =~ $ws) && $low -lt $high ]]; do
+        # echo ${lines[high]}
+        ((high--))
+    done
+
+    while [[ $low -le $high ]]; do
+        local mid=$((low + (high - low) / 2))
+        local mid_line=${lines[mid]}
+
+        if [[ mid_line =~ $ws ]]; then
+            ((mid++))
+        fi
+
+        local mid_name=$(parse_states_line "$mid_line" | sed -n '1p')
+
+        if [[ "$mid_name" == "$search_name" ]]; then
+            echo "true" "$(($low + 1))"
+            # return $(($mid + 1))
+
+        elif [[ "$mid_name" < "$search_name" ]]; then
+            low=$((mid + 1))
+        else
+            high=$((mid - 1))
+        fi
+    done
+
+    echo "false" "$(($low + 1))"
+    # return $(($low + 1))
+}
+
+# fname="bedgee.txt"
+# found=$(search_insert_pos "$fname")
+# insert_line "$FS_DIR/$LEDGER" $? "$fname,420420"
+
+
 
 get_line() {
     local file=$1
@@ -203,32 +323,49 @@ get_line() {
     sed -n "$line_num p" "$file"
 }
 
-# get_line "$FS_DIR/$STATES_NAME" 2
+# get_line "$FS_DIR/$LEDGER" 2
+
+format_file_line() {
+    local file=$1
+
+    # Get the date of the last modification from the file
+    local mod_date=$(get_mod_time "$FS_DIR/$file")
+
+    # Format the date
+    echo "$file,$mod_date"
+    return 0
+}
 
 # Write absent files to the states
 iterate_files() {
-    local fs_dir=$1
+    local base_dir=$1
 
-    if [ ! -e "$fs_dir" ]; then
-        echo "$fs_dir does not exist"
-    elif [ ! -d "$fs_dir" ]; then
-        echo "$fs_dir is not directory"
+    if [ ! -e "$base_dir" ]; then
+        echo "$base_dir does not exist"
+    elif [ ! -d "$base_dir" ]; then
+        echo "$base_dir is not directory"
     else
-        for file in "$fs_dir"/*; do
+        for file in "$base_dir"/*; do
             if [ -d "$file" ]; then
-                echo "$file is a directory"
                 iterate_files "$file"
             else
-                echo "$file"
+                local relative_path="${file#$FS_DIR/}"
+                # line_by_line "$FS_DIR/$LEDGER" "cmp_file_name" "$relative_path"
+                read found insert_index < <(search_insert_pos "$relative_path")
+                echo "Found: $found"
+                echo "Insert index: $insert_index"
+
+                if [[ $found == "false" ]]; then
+                    # File is not in the states file
+                    local line=$(format_file_line "$relative_path")
+                    insert_line "$FS_DIR/$LEDGER" $insert_index "$line"
+                    # append_line "$FS_DIR/$LEDGER" "$line"
+                fi
             fi
         done
     fi
 
 }
 
-# iterate_files "$FS_DIR"
-
-
-
-# Detect FS changes
+iterate_files "$FS_DIR" 
 

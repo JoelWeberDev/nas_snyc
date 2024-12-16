@@ -24,8 +24,9 @@
 #   - Write task to ledger
 # 3. Create ledger file and its writing functions (new script)
 
-FS_DIR="/home/joel/Development/nas/test_fs"
-LEDGER="ledger.txt"
+readonly FS_DIR="/home/joel/Development/nas/test_fs"
+readonly LEDGER="ledger.txt"
+readonly MYID=1
 
 ### Date functions ###
 
@@ -103,20 +104,87 @@ get_states() {
 
 ### Ledger interaction functions ###
 
-parse_states_line() {
+
+# Given task lists for pull and push tasks return an array of the client ids for each task
+# Please note that all tasks are comma separated with no spaces and all clients ids are separated by a hyphen from the task type
+# If there is a pull task it will always be first in the list and then all the rest will be push tasks in client id order
+parse_pull_string() {
+    local pull_string=$1
+    
+    # Check that the string has form pull(number)
+    local pattern="pull\([0-9]*\)"
+    if [[ ! $pull_string =~ $pattern ]] ; then
+        echo "invalid pull string"
+        return 1
+    fi
+
+    local pull_id=$(echo "$pull_string" | grep -o '[0-9]\+')
+
+    if [[ -z "$pull_id" ]]; then
+        echo "-1"
+    else 
+        echo "$pull_id"
+    fi
+}
+
+# pull_id=$(parse_pull_string "pull(123)")
+# parse_pull_string "pull(123)"
+# parse_pull_string "pull(1)"
+# parse_pull_string "pull()"
+
+parse_push_string() {
+    local push_string=$1
+
+    # Check that the string has form push(number1, number2, ....)
+    local pattern="push\([0-9]*(,\s*[0-9]*)*\)"
+    if [[ ! $push_string =~ $pattern ]]; then
+        echo "Invalid push string"
+        return 1
+    fi
+
+    local push_ids=$(echo "$push_string" | grep -o '[0-9]\+')
+
+    if [[ -z "$push_ids" ]]; then
+        # This indicates that there are no push ids
+        echo "-1"
+    else 
+        echo "${push_ids[@]}"
+    fi
+
+    return 0
+}
+
+# push_ids=($(parse_push_string "push(1, 2, 3, 4, 5)"))
+# parse_push_string "push(1, 2, 3, 4, 5)"
+# parse_push_string "push()"
+
+parse_line_vars() {
     # Takes a line read from the states file and parses it into a file name and date of last modification
     local line_string=$1
 
     # each line should have formate of: "file_name,mod_date"
     # fname=$(echo "$line_string" | cut -d ',' -f 1)
-    IFS="," read -ra parts <<< "$line_string"
+    IFS=";" read -ra parts <<< "$line_string"
 
-    if [ ${#parts[@]} == 2 ]; then
+    if [ ${#parts[@]} == 4 ]; then
         local fname="${parts[0]}"
         local mod_date="${parts[1]}"
+        local pull_string="${parts[2]}"
+        local push_string="${parts[3]}"
 
         echo "$fname"
         echo "$mod_date"
+
+        parse_pull_string "$pull_string"
+        if [ $? -eq 1 ]; then
+            return 1
+        fi
+        parse_push_string "$push_string"
+        if [ $? -eq 1 ]; then
+            return 1
+        fi
+
+        return 0
     else
         echo "Invalid line format"
         return 1
@@ -124,16 +192,40 @@ parse_states_line() {
 
 }
 
+# output=($(parse_line_vars "file.txt;420420;pull(123);push(1, 2, 3, 4, 56)"))
+# output=($(parse_line_vars "file.txt;420420;pull();push()"))
+# ret=$?
+# if [ $ret -eq 1 ]; then
+#     echo "Invalid line"
+# else
+#     fname=${output[0]}
+#     mod_date=${output[1]}
+#     pull_id=${output[2]}
+#     push_ids=${output[@]:3}
+
+#     echo "File name: $fname"
+#     echo "Mod_date: $mod_date"
+#     echo "Pull ids: $pull_id"
+#     echo "Push ids: ${push_ids[@]}"
+# fi
+
+
+
+
 print_line() {
     local file=$1
     local mod_date=$2
-    local line_num=$3
+    local pull_id=$3
+    local push_ids=($4)
+    local line_num=$5
     local args=("$@")
 
     echo "File: $file"
     echo "Mod date: $mod_date"
+    echo "Pull id: $pull_id"
+    echo "Push ids: ${push_ids[@]}"
     echo "Line number: $line_num"
-    echo "Args: ${args[@]:3}"
+    # echo "Args: ${args[@]:3}"
 
     return 0
 }
@@ -142,10 +234,10 @@ cmp_file_name() {
     # Compares the file name in the states file with the given file name
     local ledger_fname=$1
     local mod_date=$2
-    local line_num=$3
-    local fname=$4
-
-    # local states_fname=$(parse_states_line "$states_file" | sed -n '1p')
+    local pull_id=$3
+    local push_ids=($4)
+    local line_num=$5
+    local fname=$6
 
     if [ "$ledger_fname" == "$fname" ]; then
         return 2
@@ -176,7 +268,7 @@ queue_changed() {
 
 line_by_line() {
     # Iterates through the state file line by line and executes a function on each line
-    # The process function must take the file name, the mod date and line number as arguments
+    # The process function must take the file name; the mod date and line number as arguments
     # Process function returns are as follows:
     # 0: Success
     # 1: Failure
@@ -201,7 +293,7 @@ line_by_line() {
 
         if [[ ! ($line =~ $ignore || $line =~ $ws) ]]; then
             local output
-            output=$(parse_states_line "$line")
+            output=($(parse_line_vars "$line"))
             local valid=$?
             
             if [ $valid -eq 1 ]; then
@@ -209,11 +301,13 @@ line_by_line() {
                 continue
             else
                 # Since the line is valid we will run the process function on the output
-                local fname=$(echo "$output" | sed -n '1p')
-                local mod_date=$(echo "$output" | sed -n '2p')
+                local fname=${output[0]}
+                local mod_date=${output[1]}
+                local pull_id=${output[2]}
+                local push_ids=${output[@]:3}
                 
                 # Call the processing function on the line
-                "${process_func}" "$fname" "$mod_date" "$i" "${args[@]:2}"
+                "${process_func}" "$fname" "$mod_date" "$pull_id" "$push_ids" "$i" "${args[@]:2}"
 
                 # Check the return value of the processing function
                 local ret=$?
@@ -230,6 +324,8 @@ line_by_line() {
 
     return 0
 }
+
+# line_by_line "$FS_DIR/$LEDGER" "print_line" 
 
 append_line() {
     local fname=$1
@@ -293,7 +389,7 @@ search_insert_pos() {
             ((mid++))
         fi
 
-        local mid_name=$(parse_states_line "$mid_line" | sed -n '1p')
+        local mid_name=$(parse_line_vars "$mid_line" | sed -n '1p')
 
         if [[ "$mid_name" == "$search_name" ]]; then
             echo "true" "$(($low + 1))"
@@ -310,10 +406,18 @@ search_insert_pos() {
     # return $(($low + 1))
 }
 
+replace_line() {
+    local line_num=$1
+    local text=$2
+
+    sed -i "${line_num}c\\${text}" "$FS_DIR/$LEDGER"
+}
+
+# replace_line 20 "Definitely legit line"
+
 # fname="bedgee.txt"
 # found=$(search_insert_pos "$fname")
-# insert_line "$FS_DIR/$LEDGER" $? "$fname,420420"
-
+# insert_line "$FS_DIR/$LEDGER" $? "$fname;420420"
 
 
 get_line() {
@@ -332,7 +436,7 @@ format_file_line() {
     local mod_date=$(get_mod_time "$FS_DIR/$file")
 
     # Format the date
-    echo "$file,$mod_date"
+    echo "$file;$mod_date;pull();push()"
     return 0
 }
 
@@ -367,5 +471,5 @@ iterate_files() {
 
 }
 
-iterate_files "$FS_DIR" 
+# iterate_files "$FS_DIR" 
 
